@@ -1,0 +1,30 @@
+appId: com.preshotcome.dejarik
+productName: Dejarik
+directories:
+  buildResources: build
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,package-lock.json}'
+win:
+  target:
+    - nsis
+  # No spaces in the artifact name — GitHub mangles spaces in release asset
+  # names, which breaks updater filename matching.
+  artifactName: ${name}-${version}-setup.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: ${productName}
+  createDesktopShortcut: true
+# Auto-update feed. Same pattern as theo-desktop: installed app reads
+# app-update.yml (generated from this) and checks the PUBLIC releases repo for
+# new versions — no token needed at runtime. Publishing needs a GH token.
+publish:
+  - provider: github
+    owner: PreShotCome
+    repo: dejarik-releases
+    releaseType: release
