@@ -29,69 +29,88 @@ interface Props {
   onModelsReady?: () => void
 }
 
-// ---- holographic shader (fresnel + scanline) -------------------------------
-// Lifted straight from the Claude Design holotable: a faint Fresnel rim, plus
-// a slow horizontal scanline that crawls up the model, all in the team colour.
-// uSel boosts intensity for the currently-selected piece.
+// ---- holographic material (fresnel + scanline) -----------------------------
+// We can't roll our own ShaderMaterial here: the GLB creature models are all
+// SkinnedMeshes (rigged), and a vanilla ShaderMaterial has no bone-skinning
+// code path — render the raw vertex buffer without skinning and the model
+// ends up at random scale/position. Instead we extend MeshBasicMaterial
+// (which has built-in skinning) via onBeforeCompile, injecting our holo
+// effect right before the final colour assignment.
 
-const HOLO_VERTEX = `
-  varying vec3 vN;
-  varying vec3 vV;
-  varying vec3 vW;
-  void main() {
-    vec4 wp = modelMatrix * vec4(position, 1.0);
-    vW = wp.xyz;
-    vN = normalize(mat3(modelMatrix) * normal);
-    vV = normalize(cameraPosition - wp.xyz);
-    gl_Position = projectionMatrix * viewMatrix * wp;
-  }
-`
-
-const HOLO_FRAGMENT = `
-  uniform vec3 uColor;
-  uniform float uTime;
-  uniform float uSel;
-  uniform float uFlicker;
-  varying vec3 vN;
-  varying vec3 vV;
-  varying vec3 vW;
-  void main() {
-    float fres = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 2.3);
-    float scan = 0.5 + 0.5 * sin(vW.y * 34.0 - uTime * 3.2);
-    float band = smoothstep(0.45, 1.0, scan);
-    float lum = (0.16 + fres * 1.3 + band * 0.13) * uFlicker;
-    float a = clamp(0.14 + fres * 0.95 + band * 0.06, 0.0, 0.92) * (0.82 + uSel * 0.18);
-    vec3 col = uColor * (lum + uSel * 0.55) + vec3(1.0) * fres * 0.28 * (0.55 + uSel);
-    gl_FragColor = vec4(col, a);
-  }
-`
-
-type HoloMat = THREE.ShaderMaterial & {
-  uniforms: {
-    uColor: { value: THREE.Color }
-    uTime: { value: number }
-    uSel: { value: number }
-    uFlicker: { value: number }
-  }
+interface HoloUniforms {
+  uTime: { value: number }
+  uColor: { value: THREE.Color }
+  uSel: { value: number }
+  uFlicker: { value: number }
 }
+
+type HoloMat = THREE.MeshBasicMaterial & { holo: HoloUniforms }
 
 function makeHoloMaterial(team: Team): HoloMat {
   const color = new THREE.Color(team === 'blue' ? 0x36c8ff : 0xff5e7a)
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uColor: { value: color },
-      uTime: { value: 0 },
-      uSel: { value: 0 },
-      uFlicker: { value: 1 }
-    },
-    vertexShader: HOLO_VERTEX,
-    fragmentShader: HOLO_FRAGMENT,
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
     transparent: true,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    side: THREE.DoubleSide
+    side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending
   }) as HoloMat
+  mat.holo = {
+    uTime: { value: 0 },
+    uColor: { value: color },
+    uSel: { value: 0 },
+    uFlicker: { value: 1 }
+  }
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = mat.holo.uTime
+    shader.uniforms.uColor = mat.holo.uColor
+    shader.uniforms.uSel = mat.holo.uSel
+    shader.uniforms.uFlicker = mat.holo.uFlicker
+
+    // Pipe world-space position, normal, and view direction from the vertex
+    // stage to the fragment stage. Anchor the inject just after the
+    // built-in <project_vertex> chunk so skinning has already moved the
+    // vertex and `transformed`/`transformedNormal` are final.
+    shader.vertexShader =
+      'varying vec3 vN_holo;\nvarying vec3 vV_holo;\nvarying vec3 vW_holo;\n' +
+      shader.vertexShader.replace(
+        '#include <project_vertex>',
+        `
+        #include <project_vertex>
+        vec4 wp_holo = modelMatrix * vec4(transformed, 1.0);
+        vW_holo = wp_holo.xyz;
+        #ifdef USE_INSTANCING
+          vN_holo = normalize(mat3(modelMatrix * instanceMatrix) * objectNormal);
+        #else
+          vN_holo = normalize(mat3(modelMatrix) * objectNormal);
+        #endif
+        vV_holo = normalize(cameraPosition - wp_holo.xyz);
+        `
+      )
+
+    // Replace MeshBasicMaterial's diffuse output with the holo effect.
+    // `<opaque_fragment>` is the chunk that writes the final colour in
+    // three.js r170+; we override gl_FragColor right after it.
+    const fragInject = `
+        float fres_holo = pow(1.0 - abs(dot(normalize(vN_holo), normalize(vV_holo))), 2.3);
+        float scan_holo = 0.5 + 0.5 * sin(vW_holo.y * 34.0 - uTime * 3.2);
+        float band_holo = smoothstep(0.45, 1.0, scan_holo);
+        float lum_holo = (0.16 + fres_holo * 1.3 + band_holo * 0.13) * uFlicker;
+        float a_holo = clamp(0.14 + fres_holo * 0.95 + band_holo * 0.06, 0.0, 0.92) * (0.82 + uSel * 0.18);
+        vec3 col_holo = uColor * (lum_holo + uSel * 0.55) + vec3(1.0) * fres_holo * 0.28 * (0.55 + uSel);
+        gl_FragColor = vec4(col_holo, a_holo);
+    `
+    shader.fragmentShader =
+      'uniform vec3 uColor;\nuniform float uTime;\nuniform float uSel;\nuniform float uFlicker;\n' +
+      'varying vec3 vN_holo;\nvarying vec3 vV_holo;\nvarying vec3 vW_holo;\n' +
+      shader.fragmentShader.replace(
+        '#include <opaque_fragment>',
+        `#include <opaque_fragment>\n${fragInject}`
+      )
+  }
+  return mat
 }
+
 
 // ---- model presets ----------------------------------------------------------
 // One GLB per piece type, plus a target on-board height and any axis fix-up.
@@ -105,11 +124,15 @@ const MODEL_SRC: Record<PieceType, string> = {
   predator: 'models/predator.glb'
 }
 
+// Target physical size on the board for each piece, in world units. Applied
+// to the model's LONGEST dimension (not strictly height) so sideways-authored
+// Sketchfab models still land at a sane size. Cells are ~1.5 wide; we keep
+// pieces close to 1 unit so several can crowd a ring without clipping.
 const MODEL_H: Record<PieceType, number> = {
-  scout: 0.81,
-  brute: 1.53,
-  guardian: 1.02,
-  predator: 1.47
+  scout: 1.0,
+  brute: 1.4,
+  guardian: 1.2,
+  predator: 1.3
 }
 
 const MODEL_ROT: Record<PieceType, { x: number; y: number; z: number }> = {
@@ -251,16 +274,58 @@ function Board3D({
         (gltf) => {
           try {
             const root = gltf.scene
+            // Strip cameras, lights, and helpers — Sketchfab GLBs often ship
+            // with these and they inflate Box3.setFromObject, which would
+            // make our height-normalised scale come out tiny.
+            const toRemove: THREE.Object3D[] = []
+            root.traverse((o) => {
+              const m = o as THREE.Mesh
+              if (
+                (o as THREE.Camera).isCamera ||
+                (o as THREE.Light).isLight ||
+                ((o as THREE.LineSegments).isLineSegments && !m.isMesh) ||
+                (o as THREE.AxesHelper).type === 'AxesHelper'
+              ) {
+                toRemove.push(o)
+              }
+            })
+            for (const o of toRemove) o.parent?.remove(o)
+
             const rr = MODEL_ROT[type]
             root.rotation.set(rr.x, rr.y, rr.z)
             root.updateMatrixWorld(true)
-            // First box: normalise scale to target height.
-            let box = new THREE.Box3().setFromObject(root)
+
+            // Bounds from MESHES only (ignore empty groups whose transforms
+            // can still contribute weird offsets to a naive Box3).
+            const measure = (): THREE.Box3 => {
+              const b = new THREE.Box3()
+              b.makeEmpty()
+              root.traverse((o) => {
+                const m = o as THREE.Mesh
+                if (m.isMesh && m.geometry) {
+                  m.geometry.computeBoundingBox?.()
+                  if (m.geometry.boundingBox) {
+                    const local = m.geometry.boundingBox.clone()
+                    local.applyMatrix4(m.matrixWorld)
+                    b.union(local)
+                  }
+                }
+              })
+              return b
+            }
+
+            let box = measure()
             const size = box.getSize(new THREE.Vector3())
-            root.scale.setScalar(MODEL_H[type] / (size.y || 1))
+            // Sanity floor: if a model came in degenerate (size 0), keep
+            // scale 1 instead of dividing by zero and producing infinity.
+            const longest = Math.max(size.x, size.y, size.z) || 1
+            // Use the model's longest dimension as the basis. Some sketchfab
+            // models are sideways (length > height); MODEL_H tunes the
+            // *physical* size we want on the board, regardless of axis.
+            root.scale.setScalar(MODEL_H[type] / longest)
             root.updateMatrixWorld(true)
-            // Second box: re-centre on origin, sitting on y=0.
-            box = new THREE.Box3().setFromObject(root)
+
+            box = measure()
             root.position.set(
               -(box.min.x + box.max.x) / 2,
               -box.min.y,
@@ -270,6 +335,11 @@ function Board3D({
             wrap.add(root)
             const refs = sceneRefs.current
             if (refs) refs.modelTemplates[type] = wrap
+            console.log(
+              `[dejarik] model ready: ${type}`,
+              `raw=${size.x.toFixed(2)}x${size.y.toFixed(2)}x${size.z.toFixed(2)}`,
+              `scaled→${MODEL_H[type]} on longest axis`
+            )
           } catch (e) {
             console.warn('[dejarik] model normalise failed', type, e)
           }
@@ -383,9 +453,9 @@ function Board3D({
         const fl = flickerRef.current
           ? 0.86 + 0.14 * Math.sin(t * 6.5) + (Math.sin(t * 47.0) > 0.93 ? -0.22 : 0)
           : 1
-        for (const mat of refs.pieceMats.values()) {
-          mat.uniforms.uTime.value = t
-          mat.uniforms.uFlicker.value = fl
+        for (const [, mat] of refs.pieceMats) {
+          mat.holo.uTime.value = t
+          mat.holo.uFlicker.value = fl
         }
         // Smooth piece movement + hover bob.
         for (const [id, group] of refs.pieceMeshes) {
@@ -411,7 +481,7 @@ function Board3D({
               refs.pieceFades.set(id, next)
               group.scale.setScalar(0.6 + next * 0.4)
               const mat = refs.pieceMats.get(id)
-              if (mat) mat.uniforms.uFlicker.value = next
+              if (mat) mat.holo.uFlicker.value = next
             }
           }
         }
@@ -521,7 +591,7 @@ function Board3D({
 
     // Update selection uSel on materials.
     for (const [id, mat] of pieceMats) {
-      mat.uniforms.uSel.value = id === selectedRef.current ? 1 : 0
+      mat.holo.uSel.value = id === selectedRef.current ? 1 : 0
     }
 
     // Build the highlight overlay fresh.
